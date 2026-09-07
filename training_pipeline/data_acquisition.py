@@ -34,7 +34,7 @@ def search_universe(class_name: str, min_images: int = 50) -> list[dict]:
     # when the equivalent phrase with spaces returns real candidates. Only
     # the outgoing query is affected; the stored class_name is untouched. ──
     search_phrase = class_name.replace("_", " ").replace("-", " ")
-    query = f'class:{search_phrase} model:yolov8 images>{min_images}'
+    query = f'class:{search_phrase} images>{min_images}'
     try:
         resp = requests.get(
             UNIVERSE_SEARCH_URL,

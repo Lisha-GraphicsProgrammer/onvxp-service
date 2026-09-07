@@ -78,5 +78,11 @@
     "weights": "C:\\dev\\onvxp-service\\runs\\detect\\runs\\self_learning\\ear_protection_model\\weights\\best.pt",
     "confidence": 0.79,
     "conf_threshold": 0.5
+  },
+  "wire": {
+    "type": "custom",
+    "weights": "wire_lisha_best3.pt",
+    "confidence": 0.10,
+    "region": [450, 250, 720, 400]  
   }
 }

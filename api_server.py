@@ -1196,7 +1196,7 @@ AVAILABLE RULE TYPES:
 - "object_in_zone"  - alert when a specific OBJECT is detected (no person needed). Use for instructions like "alert when fire/smoke/forklift/truck/ladder is detected". Set "target" to the model name, e.g. {"type": "object_in_zone", "target": "fire", "required": []}
 - "person_near_object" - alert when a person comes close to a detected object. Use "target": "<model>". For "near acid/dangerous liquid/spill/chemical", use target "spill". Example: {"type": "person_near_object", "target": "spill"}
 
-IMPORTANT: "alert when X is detected" (fire, smoke, forklift, truck, ladder) means object_in_zone with target X — NOT person_in_zone. Every object_in_zone rule MUST include the "target" field, e.g. "target": "fire". Never omit it.
+IMPORTANT: "alert when X is detected" (fire, smoke, forklift, truck, ladder) means object_in_zone with target X — NOT person_in_zone. Every object_in_zone rule MUST include the "target" field, e.g. "target": "fire". Never omit it. For "target" values, preserve meaningful descriptive qualifiers rather than reducing to the single simplest word, especially for object names that mean different things in different domains (e.g. "wire" could mean electrical wire, surgical wire, or dental wire). Use "exposed electrical wire" rather than just "wire" when the instruction includes that context. Only use the bare single word when the object itself is unambiguous (e.g. "forklift", "fire").
 IMPORTANT: "alert everyone near acid/spill/chemical/hazardous liquid" means person_near_object with target "spill" — NOT object_in_zone (this rule cares about people approaching the object, not just the object's presence). Never omit "target" on a person_near_object rule.
 OUTPUT FORMAT (must match exactly):
 {

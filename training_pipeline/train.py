@@ -17,7 +17,7 @@ DATASETS_DIR = Path("datasets")
 RUNS_DIR = Path("runs") / "self_learning"
 
 
-def train_model(class_name: str, epochs: int = 10, imgsz: int = 640, resume_from: str | None = None, on_epoch_end=None) -> dict:
+def train_model(class_name: str, epochs: int = 6, imgsz: int = 416, resume_from: str | None = None, on_epoch_end=None) -> dict:
     """
     Trains a YOLO26n model on datasets/<class_name>/data.yaml.
     If resume_from is given (a path to a previous last.pt), continues from
