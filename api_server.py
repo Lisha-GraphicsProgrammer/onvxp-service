@@ -1502,6 +1502,18 @@ def rebuild_pipeline_config_from_db(db: Session, site_id: int, camera_id: int = 
     return merged
 
 
+def _rule_signature(rule: dict) -> tuple:
+    """Identifies a rule by its actual behavior, ignoring rule_db_id
+    (stamped on after merge, so two mentions of the same logical rule at
+    different points wouldn't share it yet) — used to stop the same rule
+    being appended twice into one pipeline config."""
+    ignore_keys = {"rule_db_id"}
+    return tuple(sorted(
+        (k, json.dumps(v, sort_keys=True) if isinstance(v, (list, dict)) else v)
+        for k, v in rule.items() if k not in ignore_keys
+    ))
+
+
 def merge_configs(existing: dict, new_cfg: dict) -> dict:
     SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
     existing_zone_names = {z["name"] for z in existing.get("zones", [])}
@@ -1510,7 +1522,17 @@ def merge_configs(existing: dict, new_cfg: dict) -> dict:
         if zone["name"] not in existing_zone_names:
             merged_zones.append(zone)
             existing_zone_names.add(zone["name"])
-    merged_rules = list(existing.get("rules", [])) + list(new_cfg.get("rules", []))
+
+    # FIX: previously appended new_cfg's rules unconditionally, so the
+    # same logical rule could end up duplicated inside one active
+    # pipeline's rule list, evaluated twice per frame every frame.
+    merged_rules = list(existing.get("rules", []))
+    existing_signatures = {_rule_signature(r) for r in merged_rules}
+    for rule in new_cfg.get("rules", []):
+        sig = _rule_signature(rule)
+        if sig not in existing_signatures:
+            merged_rules.append(rule)
+            existing_signatures.add(sig)
     merged_models = {**existing.get("models", {}), **new_cfg.get("models", {})}
     existing_sev = existing.get("alert", {}).get("severity", "medium")
     new_sev = new_cfg.get("alert", {}).get("severity", "medium")
@@ -1561,7 +1583,7 @@ async def apply_rule(
         try:
             dupes = db.query(Rule).filter(
                 Rule.site_id == current_user.site_id,
-                Rule.status == "active",
+                Rule.status.in_(["active", "inactive", "pending_training"]),
                 Rule.instruction == instruction,
             ).all()
             for d in dupes:
