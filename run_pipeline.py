@@ -257,22 +257,6 @@ def check_required_gear(person_bbox, frame, required_gear, loaded_models):
 
 # ============================================================
 # HELPER: object_in_zone — LOCAL YOLO model path
-#
-# FIX (applied tonight): previously returned on the FIRST in-zone box
-# that cleared threshold, same bug as the remote path had. Now scans all
-# candidates and picks the highest-confidence one.
-#
-# ADDITIONAL FIX for 'wire' specifically: wire_lisha_best3.pt confuses
-# "person in PPE" and "exposed wire" under one class label ("warning"),
-# and fires MUCH more confidently on people (~0.31) than on the real wire
-# (~0.17, confirmed by manual box inspection tonight — box
-# [541,265,675,376] at conf=0.167 genuinely lands on the frayed copper).
-# Highest-confidence-alone would therefore always pick the person, not
-# the wire. To work around this without retraining, a registry entry can
-# optionally set "region": [x_min, y_min, x_max, y_max] — candidates
-# outside that box are ignored entirely before confidence comparison.
-# This is a stopgap, not a real fix; the real fix is better training
-# data so the model tells wire and people apart on its own.
 # ============================================================
 def check_object_in_zone_local(frame, target_model_name, zone_poly, loaded_models):
     entry = registry.get(target_model_name, {})
@@ -310,22 +294,6 @@ def check_object_in_zone_local(frame, target_model_name, zone_poly, loaded_model
 
 # ============================================================
 # HELPER: object_in_zone — REMOTE Roboflow-hosted model path
-#
-# FIX (applied tonight): previously this function returned on the FIRST
-# in-zone prediction that cleared the confidence threshold, regardless of
-# whether a higher-confidence prediction existed later in the same
-# response. This caused a real bug: on frame 82 of wire_video_two.mp4,
-# the API returned multiple candidate boxes in one response (a low-
-# confidence hit on a scaffolding bracket AND an 85%-confidence hit on
-# the actual exposed wire), and the old code grabbed the bracket simply
-# because it appeared first in the predictions list. Confirmed via
-# Lisha's separate Colab-trained run of the same model, which correctly
-# drew "exposed_wire" at 85% confidence on the real wire in the same
-# frame — proving the model itself was fine; our selection logic wasn't.
-#
-# Fix: scan the full predictions list, keep only in-zone + above-
-# threshold candidates, and return the one with the HIGHEST confidence,
-# not the first one encountered.
 # ============================================================
 def check_object_in_zone_remote(frame, model_name, zone_poly):
     entry = registry.get(model_name, {})
@@ -384,14 +352,6 @@ def check_object_in_zone_remote(frame, model_name, zone_poly):
 
 # ============================================================
 # HELPER: object_in_zone — Grounding DINO, LOCAL (no network call)
-#
-# IMPORTANT: torch and transformers are imported LAZILY, only inside the
-# two functions below, only at the moment a rule actually needs this
-# model type — never at the top of this file. This means a broken local
-# torch/transformers install (e.g. a bad CUDA DLL) ONLY breaks a rule
-# using grounding_dino_local specifically; every other model type
-# (custom YOLO weights, coco_default, roboflow_remote) keeps working
-# completely normally regardless of torch's state on this machine.
 # ============================================================
 _dino_cache = {}
 
@@ -409,15 +369,6 @@ def _get_dino_model(model_id: str):
 
 
 def check_object_in_zone_dino(frame, model_name, zone_poly):
-    """Registry entry shape:
-        "wire": {
-          "type": "grounding_dino_local",
-          "model_id": "IDEA-Research/grounding-dino-tiny",
-          "prompt": "damaged cable.",
-          "confidence": 0.5
-        }
-    "prompt" must follow Grounding DINO's required format: lowercase,
-    each phrase ends with a period."""
     import torch
     entry = registry.get(model_name, {})
     model_id = entry.get("model_id", "IDEA-Research/grounding-dino-tiny")
@@ -591,6 +542,101 @@ for frame_idx, result in enumerate(results):
 
         active_violations[cooldown_key] = frame_idx
 
+    # ============================================================
+    # COUNT_EXCEEDED — zone occupancy check
+    #
+    # FIX: previously this fired unconditionally for EVERY person
+    # individually, inside the per-person loop below, completely ignoring
+    # rule['count']. That meant a "no more than 5 people" rule fired the
+    # instant ANY person entered the zone — identical to plain
+    # person_in_zone — and fired ONCE PER PERSON in the zone each frame,
+    # so 6 people in a 5-person limit produced 6 incidents, not 1.
+    #
+    # Fix: count everyone currently tracked inside the zone THIS frame in
+    # a single pass (not per-person), compare against rule['count'], and
+    # fire at most one incident per rule when the threshold is exceeded.
+    # Cooldown is keyed per-rule — same pattern as object_in_zone's
+    # (rule_idx, 'object') key — since this is one zone-level violation,
+    # not one per excess person.
+    # ============================================================
+    if result.boxes is not None and result.boxes.id is not None:
+        all_boxes = result.boxes.xyxy.cpu().numpy()
+        all_ids = result.boxes.id.cpu().numpy()
+
+        for rule_idx, rule in enumerate(rules):
+            if rule.get('type') != 'count_exceeded':
+                continue
+            zone_name = rule.get('zone', '')
+            if zone_name not in zones_map:
+                continue
+
+            zone = zones_map[zone_name]
+            threshold = rule.get('count', 5)
+
+            occupants = 0
+            for box in all_boxes:
+                bx1, by1, bx2, by2 = box
+                cx = (bx1 + bx2) / 2
+                cy = by2
+                if point_in_polygon(cx, cy, zone['poly']):
+                    occupants += 1
+
+            cooldown_key = (rule_idx, 'count')
+
+            if occupants <= threshold:
+                if cooldown_key in active_violations:
+                    if frame_idx - active_violations[cooldown_key] > 150:
+                        del active_violations[cooldown_key]
+                continue
+
+            if cooldown_key not in active_violations:
+                incident_count += 1
+                incident_id = f"inc_{incident_count:04d}"
+                screenshot_path = f"incidents/{incident_id}.jpg"
+
+                orig_frame = result.orig_img.copy()
+                for det_box, det_id in zip(all_boxes, all_ids):
+                    bx1, by1, bx2, by2 = map(int, det_box)
+                    det_id_val = int(det_id) if det_id is not None else 0
+                    cv2.rectangle(orig_frame, (bx1, by1), (bx2, by2), (255, 100, 0), 2)
+                    label = f"id:{det_id_val} person"
+                    (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                    cv2.rectangle(orig_frame, (bx1, by1 - lh - 8), (bx1 + lw + 4, by1), (255, 100, 0), -1)
+                    cv2.putText(orig_frame, label, (bx1 + 2, by1 - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+                for zn, zd in zones_map.items():
+                    if zn.endswith('_full_frame'):
+                        continue
+                    color = (0, 255, 255) if zn == zone_name else (0, 180, 180)
+                    pts = np.array(zd['poly'], dtype=np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(orig_frame, [pts], isClosed=True, color=color, thickness=2)
+                    cv2.putText(orig_frame, zn.replace("_", " ").upper(),
+                                (int(zd['x_min']) + 4, int(zd['y_min']) + 18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+                cv2.imwrite(screenshot_path, orig_frame)
+
+                incident = {
+                    "id":              incident_id,
+                    "timestamp":       datetime.now().isoformat(),
+                    "frame":           frame_idx,
+                    "camera":          video,
+                    "person_id":       None,
+                    "violation":       "count_exceeded",
+                    "missing_gear":    [],
+                    "zone":            zone_name,
+                    "rule_index":      rule_idx,
+                    "bbox":            [],
+                    "screenshot_path": screenshot_path,
+                    "rule_type":       "count_exceeded",
+                    "alert_message":   config['alert']['message']
+                }
+                append_incident(incident)
+                print(f"Frame {frame_idx}: count_exceeded in {zone_name} — {occupants} people (limit {threshold}) → {incident_id} [SAVED]")
+
+            active_violations[cooldown_key] = frame_idx
+
     if result.boxes is None or result.boxes.id is None:
         continue
 
@@ -601,7 +647,7 @@ for frame_idx, result in enumerate(results):
         person_bottom_y = y2
 
         for rule_idx, rule in enumerate(rules):
-            if rule.get('type') == 'object_in_zone':
+            if rule.get('type') in ('object_in_zone', 'count_exceeded'):
                 continue
 
             zone_name = rule.get('zone', '')
@@ -636,10 +682,6 @@ for frame_idx, result in enumerate(results):
 
             elif rule_type == "person_in_zone":
                 violation_occurred = True
-
-            elif rule_type == "count_exceeded":
-                violation_occurred = True
-                violation_type = "person_in_zone"
 
             if violation_occurred and cooldown_key not in active_violations:
                 incident_count += 1
