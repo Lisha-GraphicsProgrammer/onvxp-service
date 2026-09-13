@@ -27,9 +27,6 @@ class User(Base):
     last_login    = Column(TIMESTAMP(timezone=True))
 
 
-# ── Zone — a named building/place (e.g. "Tower Two", "Main Warehouse").
-# No polygon, no color, no single-camera tie: it's purely an organizational
-# label a camera belongs to, not a hand-drawn region within a frame. ──
 class Zone(Base):
     __tablename__ = "zones"
     id         = Column(Integer, primary_key=True)
@@ -38,8 +35,6 @@ class Zone(Base):
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
 
-# ── Camera — now belongs to exactly one Zone (a building/place), inverting
-# the old relationship where Zone belonged to one Camera. ──
 class Camera(Base):
     __tablename__ = "cameras"
     id         = Column(Integer, primary_key=True)
@@ -62,18 +57,16 @@ class Rule(Base):
     instruction = Column(Text, nullable=False)
     config_json = Column(JSONB, nullable=False)
     pipeline_id = Column(Text)
+    # Valid values: "active", "inactive", "pending_training", "shadow",
+    # "replaced", "deleted". "shadow" = the rule runs and is evaluated by
+    # the live pipeline, but its incidents are flagged is_shadow=True and
+    # excluded from the normal Alerts view until an admin promotes it.
     status      = Column(Text, default="active", nullable=False)
     severity    = Column(Text)
     created_at  = Column(TIMESTAMP(timezone=True), server_default=func.now())
     updated_at  = Column(TIMESTAMP(timezone=True), server_default=func.now())
-    # Which camera(s) this rule applies to now lives in RuleCamera below —
-    # a rule can span any combination of cameras across any zones, so a
-    # single zone_id/camera_id column can't represent that anymore.
 
 
-# ── Join table: one rule can apply to many cameras, and (implicitly, since
-# each camera belongs to one zone) any combination of zones too — e.g. a
-# single rule watching Camera 1 in Zone 1 and Camera 4 in Zone 5 at once. ──
 class RuleCamera(Base):
     __tablename__ = "rule_cameras"
     id        = Column(Integer, primary_key=True)
@@ -102,6 +95,10 @@ class Incident(Base):
     review_status    = Column(Text)
     reviewed_by      = Column(Integer, ForeignKey("users.id"))
     reviewed_at      = Column(TIMESTAMP(timezone=True))
+    # Stamped at creation time from the rule's status at that moment — a
+    # rule later promoted out of shadow doesn't retroactively reclassify
+    # incidents it already logged while still in shadow.
+    is_shadow        = Column(Boolean, default=False, nullable=False)
 
 
 class Setting(Base):
