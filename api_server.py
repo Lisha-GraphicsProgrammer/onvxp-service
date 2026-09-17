@@ -17,6 +17,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from collections import defaultdict
+import difflib
 import csv
 import io
 
@@ -1347,6 +1348,20 @@ async def generate_rule(
                 elif model_keys:
                     r["target"] = model_keys[0]
                     print(f"[OMNIX] Sanitizer: filled missing target='{model_keys[0]}' on {r.get('type')} rule")
+            elif r.get("type") not in ("object_in_zone", "person_near_object") and r.get("target"):
+                # Per this prompt's own spec above: "target" only belongs on
+                # object_in_zone and person_near_object rules. The LLM
+                # sometimes emits it anyway on other rule types despite
+                # being told not to (observed: a missing_in_zone rule with
+                # target="vest" alongside another, otherwise identical,
+                # missing_in_zone rule generated with no target field at
+                # all) — that stray field makes two rules meaning the same
+                # thing look structurally different to anything comparing
+                # rule shape (fuzzy dedup, future consumers). Strip it here,
+                # once, rather than every downstream reader having to guess
+                # which rules might carry it.
+                stray = r.pop("target")
+                print(f"[OMNIX] Sanitizer: stripped stray target='{stray}' from {r.get('type')} rule (not part of this rule type's schema)")
             if r.get("type") == "person_near_object" and not r.get("proximity_px"):
                 r["proximity_px"] = 120
             if r.get("type") == "count_exceeded" and not r.get("count"):
@@ -1596,6 +1611,49 @@ def merge_configs(existing: dict, new_cfg: dict) -> dict:
     }
 
 
+INSTRUCTION_SIMILARITY_THRESHOLD = 0.85
+
+
+def _normalize_instruction(text: str) -> str:
+    """Lowercases, collapses whitespace, and strips trailing punctuation so
+    minor typos/phrasing differences ("doesn't" vs "doesnt", double spaces,
+    a trailing period) don't prevent two rules that mean the same thing
+    from being recognized as duplicates."""
+    return " ".join(text.lower().strip().rstrip(".!").split())
+
+
+def _rule_target_signature(config: dict) -> frozenset:
+    """A rule's fingerprint for dedup purposes. Which field actually
+    identifies WHAT a rule checks differs by rule type, per this file's
+    own SYSTEM_PROMPT schema (see the AVAILABLE RULE TYPES block above):
+      - object_in_zone / person_near_object: "target" is the real object.
+      - missing_in_zone: "required" (the gear list) is the real signal.
+        "primary" is always "person" here — who's being checked, not
+        what — so using it as the differentiator would make a "missing
+        vest" rule and a "missing helmet" rule in the same zone look
+        identical and get wrongly merged.
+      - count_exceeded: no object at all, just a zone + threshold.
+    """
+    sig = set()
+    for r in config.get("rules", []):
+        rtype = r.get("type", "")
+        if rtype in ("object_in_zone", "person_near_object"):
+            what = (r.get("target") or "").lower()
+        elif rtype == "missing_in_zone":
+            what = ",".join(sorted(x.lower() for x in r.get("required", [])))
+        else:
+            what = ""
+        sig.add((rtype, what, (r.get("zone") or "").lower()))
+    return frozenset(sig)
+
+
+def _instructions_similar(a: str, b: str, threshold: float = INSTRUCTION_SIMILARITY_THRESHOLD) -> bool:
+    na, nb = _normalize_instruction(a), _normalize_instruction(b)
+    if na == nb:
+        return True
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= threshold
+
+
 @app.post("/api/rules/apply")
 async def apply_rule(
     request: Request,
@@ -1624,15 +1682,27 @@ async def apply_rule(
 
         missing = _missing_models_for_config(new_config)
         try:
-            dupes = db.query(Rule).filter(
+            # Fuzzy dedup: catches near-identical wording ("doesn't wear
+            # helmet" vs "doesnt wear any helmet"), not just exact text
+            # matches. Loads all non-deleted rules for the site and checks
+            # similarity in Python rather than in SQL — fine at current
+            # rule counts (tens, not thousands); revisit if that changes.
+            candidate_rules = db.query(Rule).filter(
                 Rule.site_id == current_user.site_id,
                 Rule.status.in_(["active", "inactive", "pending_training"]),
-                Rule.instruction == instruction,
             ).all()
+
+            new_targets = _rule_target_signature(new_config)
+            dupes = [
+                r for r in candidate_rules
+                if _instructions_similar(r.instruction, instruction)
+                and _rule_target_signature(r.config_json) == new_targets
+            ]
+
             for d in dupes:
                 d.status = "replaced"
             if dupes:
-                print(f"[OMNIX] Dedupe: marked {len(dupes)} identical active rule(s) as replaced")
+                print(f"[OMNIX] Dedupe: marked {len(dupes)} similar rule(s) as replaced (fuzzy match)")
             rule = Rule(
                 site_id=current_user.site_id, user_id=current_user.id,
                 instruction=instruction, config_json=new_config,
