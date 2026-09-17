@@ -4,10 +4,10 @@ Self-Learning Pipeline — Background Worker
 Polls for training jobs that need advancing and runs the next stage
 automatically. This is what makes the pipeline truly autonomous, once a
 rule creates a pending job, this worker picks it up and walks it through
-search -> prep -> train -> evaluate with zero manual intervention.
+search -> prep -> validate -> train -> evaluate with zero manual intervention.
 
 Run this once, in its own terminal, and leave it running:
-    py -3.11 training_pipeline\worker.py
+    py -3.11 training_pipeline\\worker.py
 
 Routes purely by current_stage, never by status, so re-checking a job that
 is mid-stage never re-triggers an earlier stage by mistake.
@@ -20,6 +20,7 @@ from db.session import SessionLocal
 from db.models import TrainingJob
 from training_pipeline.data_acquisition import run_for_job as acquire_step
 from training_pipeline.dataset_prep import run_for_job as prep_step
+from training_pipeline.validate_samples import run_for_job as validate_step
 from training_pipeline.train import run_for_job as train_step
 from training_pipeline.evaluate import run_for_job as eval_step
 
@@ -30,6 +31,7 @@ STAGE_HANDLERS = {
     "queued": acquire_step,
     "searching_data": acquire_step,
     "preparing_dataset": prep_step,
+    "validating_dataset": validate_step,
     "training": lambda job_id, db, Model: train_step(job_id, db, Model, epochs=EPOCHS),
     "evaluating": eval_step,
 }

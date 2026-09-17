@@ -22,6 +22,12 @@ def verify_with_dino(image_paths, class_prompt, confidence=0.3):
     from PIL import Image
     from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
+    # Grounding DINO requires lowercase text ending in a period, or it
+    # silently returns zero detections regardless of what's in the image.
+    class_prompt = class_prompt.lower().strip()
+    if not class_prompt.endswith("."):
+        class_prompt += "."
+
     processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-tiny")
     model = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-tiny")
 
@@ -94,6 +100,51 @@ def validate_dataset(dataset_dir: str, class_prompt: str, min_agreement: float =
         "reason": None if passed else
             f"Only {agree:.0%} of sampled images visually matched '{class_prompt}' (required {min_agreement:.0%})",
     }
+
+
+def run_for_job(job_id: int, db_session, TrainingJob):
+    """Runs the visual pre-flight check for a training job and updates its
+    DB row. Called right after dataset prep succeeds, before training ever
+    starts — this is the actual gate that stops a mismatched dataset from
+    burning a full training run before anyone notices."""
+    import os
+    from datetime import datetime, timezone
+
+    job = db_session.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+    if not job:
+        return
+
+    def _push_stage(name, status, detail=None):
+        stages = list(job.stages or [])
+        stages.append({
+            "name": name, "status": status, "detail": detail,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+        job.stages = stages
+        job.current_stage = name if status == "running" else job.current_stage
+        db_session.commit()
+
+    _push_stage("validating_dataset", "running", "Sampling images and checking visual match...")
+
+    dataset_dir = f"datasets/{job.class_name}"
+    class_prompt = job.class_name.replace("_", " ")
+    api_key = os.getenv("ANTHROPIC_API_KEY")  # falls back to local DINO model if unset
+
+    result = validate_dataset(dataset_dir, class_prompt, anthropic_api_key=api_key)
+
+    existing_info = dict(job.dataset_info or {})
+    existing_info["validation_report"] = result
+    job.dataset_info = existing_info
+
+    if result["passed"]:
+        job.current_stage = "training"
+        detail = f"{result['agreement_rate']:.0%} of {result['sample_size']} sampled images visually matched '{class_prompt}'"
+        _push_stage("validating_dataset", "done", detail)
+    else:
+        job.status = "failed"
+        job.error = f"Dataset didn't visually match requested class: {result['reason']}"
+        _push_stage("validating_dataset", "failed", result["reason"])
+        db_session.commit()
 
 
 if __name__ == "__main__":

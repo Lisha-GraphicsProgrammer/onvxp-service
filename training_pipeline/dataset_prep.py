@@ -316,7 +316,7 @@ def run_for_job(job_id: int, db_session, TrainingJob):
         existing_info = dict(job.dataset_info or {})
         existing_info["prep_report"] = result
         job.dataset_info = existing_info
-        job.current_stage = "training"
+        job.current_stage = "validating_dataset"
         isolated_note = ""
         if result.get("isolated_class_index") is not None:
             isolated_note = (
