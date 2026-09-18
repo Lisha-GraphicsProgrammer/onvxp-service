@@ -89,6 +89,7 @@ class Incident(Base):
     zone             = Column(Text)
     bbox             = Column(JSONB)
     screenshot_path  = Column(Text)
+    clip_path        = Column(Text)
     severity         = Column(Text)
     alert_message    = Column(Text)
     reviewed         = Column(Boolean, default=False, nullable=False)
