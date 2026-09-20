@@ -48,10 +48,10 @@ def get_db_refs():
         camera = db.query(CameraModel).first()
         rule = db.query(Rule).filter(
             Rule.pipeline_id == config['pipeline_id'],
-            Rule.status.in_(['active', 'shadow'])
+            Rule.status == 'active'
         ).first()
         if not rule:
-            rule = db.query(Rule).filter(Rule.status.in_(['active', 'shadow'])).first()
+            rule = db.query(Rule).filter(Rule.status == 'active').first()
         db.close()
         return (
             site.id if site else None,
@@ -175,7 +175,6 @@ def append_incident(incident: dict):
                 severity=config.get("alert", {}).get("severity", "medium"),
                 alert_message=incident.get("alert_message"),
                 reviewed=False,
-                is_shadow=bool(incident.get("is_shadow", False)),
             )
             db.add(db_incident)
             db.commit()
@@ -600,7 +599,6 @@ for frame_idx, result in enumerate(results):
                 "clip_path":       clip_path,
                 "rule_type":       "object_in_zone",
                 "alert_message":   config['alert']['message'],
-                "is_shadow":       bool(rule.get('is_shadow', False)),
             }
             append_incident(incident)
             print(f"Frame {frame_idx}: {target} detected in {zone_name} → {incident_id} [SAVED] (clip: {clip_path})")
@@ -693,7 +691,6 @@ for frame_idx, result in enumerate(results):
                     "clip_path":       clip_path,
                     "rule_type":       "count_exceeded",
                     "alert_message":   config['alert']['message'],
-                    "is_shadow":       bool(rule.get('is_shadow', False)),
                 }
                 append_incident(incident)
                 print(f"Frame {frame_idx}: count_exceeded in {zone_name} — {occupants} people (limit {threshold}) → {incident_id} [SAVED] (clip: {clip_path})")
@@ -798,7 +795,6 @@ for frame_idx, result in enumerate(results):
                     "clip_path":       clip_path,
                     "rule_type":       rule_type,
                     "alert_message":   config['alert']['message'],
-                    "is_shadow":       bool(rule.get('is_shadow', False)),
                 }
 
                 append_incident(incident)

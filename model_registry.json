@@ -2,14 +2,14 @@
   "person": {
     "type": "coco_default",
     "class_id": 0,
-    "model": "yolo26n.pt",
+    "model": "yolov8n.pt",
     "confidence": 0.5,
     "conf_threshold": 0.4
   },
   "truck": {
     "type": "coco_default",
     "class_id": 7,
-    "model": "yolo26n.pt",
+    "model": "yolov8n.pt",
     "confidence": 0.7,
     "conf_threshold": 0.5
   },
