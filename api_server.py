@@ -529,7 +529,6 @@ def get_incidents(
     review: str = None,
     date_from: str = None,
     date_to: str = None,
-    include_shadow: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -537,11 +536,6 @@ def get_incidents(
     offset = max(0, offset)
     try:
         base_q = db.query(Incident).filter(Incident.site_id == current_user.site_id)
-        # Shadow-mode incidents are hidden from the normal Alerts view by
-        # default — pass include_shadow=true to see them (used by a
-        # dedicated shadow-review screen, not the main Alerts page).
-        if not include_shadow:
-            base_q = base_q.filter(Incident.is_shadow.isnot(True))
         if rule_id is not None:
             base_q = base_q.filter(Incident.rule_id == rule_id)
         if camera_id is not None:
@@ -834,6 +828,15 @@ def get_training_job(
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Training job not found")
+
+    # Same URL pattern as incident screenshots — sample images live in the
+    # same incidents/ folder, served through the existing /screenshots/
+    # mount, no new static route needed.
+    sample_image_urls = [
+        f"{PUBLIC_BASE_URL}/screenshots/{Path(p).name}"
+        for p in (job.sample_images or [])
+    ]
+
     return {
         "id": job.id,
         "class_name": job.class_name,
@@ -844,6 +847,7 @@ def get_training_job(
         "metrics": job.metrics,
         "model_path": job.model_path,
         "error": job.error,
+        "sample_images": sample_image_urls,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }
@@ -895,15 +899,10 @@ def approve_training_job(
         if pending_rule and pending_rule.status == "pending_training":
             sibling_jobs = db.query(TrainingJob).filter(TrainingJob.rule_id == job.rule_id).all()
             if all(j.status == "approved" for j in sibling_jobs):
-                # Shadow mode: a freshly-approved model goes to "shadow", not
-                # "active" — it runs and is evaluated by the live pipeline,
-                # but its incidents are excluded from the normal Alerts view
-                # until an admin explicitly promotes it, per the original
-                # design spec's shadow-mode definition.
-                pending_rule.status = "shadow"
+                pending_rule.status = "active"
                 db.commit()
                 background_tasks.add_task(_rebuild_and_restart_pipeline_bg, pending_rule.site_id)
-                activated_rule = {"id": pending_rule.id, "instruction": pending_rule.instruction, "status": "shadow"}
+                activated_rule = {"id": pending_rule.id, "instruction": pending_rule.instruction, "status": "active"}
 
     return {
         "status": "approved",
@@ -1181,32 +1180,6 @@ def deactivate_rule(
     background_tasks.add_task(_rebuild_and_restart_pipeline_bg, current_user.site_id)
     return {"status": "deactivated", "rule_id": rule_id}
 
-@app.post("/api/rules/{rule_id}/promote")
-def promote_rule(
-    rule_id: int,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Promotes a rule from 'shadow' to 'active' — the admin's explicit
-    sign-off after reviewing what it would have flagged. Past incidents
-    logged while it was in shadow stay is_shadow=True; only new detections
-    after promotion count as real, alerting incidents."""
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can promote a shadow rule")
-    rule = db.query(Rule).filter(
-        Rule.id == rule_id,
-        Rule.site_id == current_user.site_id
-    ).first()
-    if not rule:
-        raise HTTPException(status_code=404, detail="Rule not found")
-    if rule.status != "shadow":
-        raise HTTPException(status_code=400, detail=f"Rule is '{rule.status}', not in shadow mode")
-    rule.status = "active"
-    db.commit()
-    background_tasks.add_task(_rebuild_and_restart_pipeline_bg, current_user.site_id)
-    return {"status": "promoted", "rule_id": rule_id}
-
 
 SYSTEM_PROMPT = """You are ONVXP's rule generator. Convert plain English safety instructions into valid pipeline_config.json for a YOLO26 + ByteTrack computer vision pipeline.
 
@@ -1481,17 +1454,12 @@ def rebuild_pipeline_config_from_db(db: Session, site_id: int, camera_id: int = 
     frame — there's no user-drawn polygon anymore, since zones are just
     named buildings/places now, not regions within a frame.
     """
-        # Shadow-mode rules run through the exact same live pipeline as active
-    # rules — the only difference is what happens to their incidents once
-    # detected (see the is_shadow stamping in run_pipeline.py). Excluding
-    # them here would defeat the purpose of shadow mode entirely: there'd
-    # be nothing to actually review before promotion.
     active_rules = (
         db.query(Rule)
         .join(RuleCamera, RuleCamera.rule_id == Rule.id)
         .filter(
             Rule.site_id == site_id,
-            Rule.status.in_(["active", "shadow"]),
+            Rule.status == "active",
             RuleCamera.camera_id == camera_id,
         )
         .order_by(Rule.created_at.asc())
@@ -1536,18 +1504,17 @@ def rebuild_pipeline_config_from_db(db: Session, site_id: int, camera_id: int = 
     zone_name = _full_frame_zone_name(camera_id)
     zone_coords = _full_frame_coords_for_camera(camera_id, db)
 
-    def stamp(cfg: dict, rule_db_id: int, is_shadow: bool) -> dict:
+    def stamp(cfg: dict, rule_db_id: int) -> dict:
         cfg = json.loads(json.dumps(cfg))
         cfg["zones"] = [{"name": zone_name, "coords": zone_coords}]
         for r in cfg.get("rules", []):
             r["rule_db_id"] = rule_db_id
             r["zone"] = zone_name
-            r["is_shadow"] = is_shadow
         return cfg
 
-    merged = stamp(runnable_rules[0].config_json, runnable_rules[0].id, runnable_rules[0].status == "shadow")
+    merged = stamp(runnable_rules[0].config_json, runnable_rules[0].id)
     for db_rule in runnable_rules[1:]:
-        stamped_cfg = stamp(db_rule.config_json, db_rule.id, db_rule.status == "shadow")
+        stamped_cfg = stamp(db_rule.config_json, db_rule.id)
         merged = merge_configs(merged, stamped_cfg)
 
     site_settings = get_settings_for_site(db, site_id)
