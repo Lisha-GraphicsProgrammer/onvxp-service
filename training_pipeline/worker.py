@@ -39,6 +39,23 @@ STAGE_HANDLERS = {
 DONE_STAGES = ("awaiting_approval", "approved")
 TERMINAL_STATUSES = ("failed", "cancelled", "approved")
 
+def _mark_rule_failed(job, db):
+    """A job failing (however it failed — bad dataset, crash, gate rejection)
+    should never leave its rule stuck showing "TRAINING" forever. Sets the
+    rule to inactive so the Rules page stops displaying a spinner for
+    something that already died. This is the single place that runs after
+    EVERY stage handler and every crash path, so no individual training
+    file (data_acquisition.py, train.py, evaluate.py, etc.) needs its own
+    copy of this logic."""
+    from db.models import Rule
+    if not job.rule_id:
+        return
+    rule = db.query(Rule).filter(Rule.id == job.rule_id).first()
+    if rule and rule.status == "pending_training":
+        rule.status = "training_failed"
+        db.commit()
+        print(f"[WORKER] Rule {rule.id} set to training_failed (linked job {job.id} failed)")
+
 
 def process_once():
     db = SessionLocal()
@@ -62,11 +79,14 @@ def process_once():
                 handler(job.id, db, TrainingJob)
                 db.refresh(job)
                 print(f"[WORKER] Job {job.id} ({job.class_name}): now at '{job.current_stage}', status '{job.status}'")
+                if job.status == "failed":
+                    _mark_rule_failed(job, db)
             except Exception as e:
                 print(f"[WORKER] Job {job.id} ({job.class_name}): stage '{stage}' crashed: {e}")
                 job.status = "failed"
                 job.error = f"Worker crash during {stage}: {e}"
                 db.commit()
+                _mark_rule_failed(job, db)
     finally:
         db.close()
 
