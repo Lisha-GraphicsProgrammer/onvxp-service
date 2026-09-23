@@ -231,6 +231,7 @@ def run_for_job(job_id: int, db_session, TrainingJob):
 
     job.metrics = result["metrics"]
     job.sample_images = result.get("sample_images", [])
+    job.vlm_check = result.get("vlm_check", {})
     m = result["metrics"]
     detail = f"Precision {m['precision']:.2f}, Recall {m['recall']:.2f}, mAP50 {m['map50']:.2f}"
 

@@ -253,6 +253,20 @@ def _self_learning_worker_loop():
     DONE_STAGES = ("awaiting_approval", "approved")
     TERMINAL_STATUSES = ("failed", "cancelled", "approved")
 
+    def _mark_rule_failed(job, db):
+        """A job failing (bad dataset, crash, gate rejection) should never
+        leave its rule stuck showing "TRAINING" forever. Same helper as
+        worker.py — kept in sync here since this internal loop is the one
+        that actually runs in production."""
+        from db.models import Rule
+        if not job.rule_id:
+            return
+        rule = db.query(Rule).filter(Rule.id == job.rule_id).first()
+        if rule and rule.status == "pending_training":
+            rule.status = "training_failed"
+            db.commit()
+            print(f"[SELF-LEARNING] Rule {rule.id} set to training_failed (linked job {job.id} failed)")
+
     while True:
         db2 = SessionLocal()
         try:
@@ -271,11 +285,14 @@ def _self_learning_worker_loop():
                     handler(job.id, db2, TrainingJob)
                     db2.refresh(job)
                     print(f"[SELF-LEARNING] Job {job.id} ({job.class_name}): now at '{job.current_stage}', status '{job.status}'")
+                    if job.status == "failed":
+                        _mark_rule_failed(job, db2)
                 except Exception as e:
                     print(f"[SELF-LEARNING] Job {job.id} ({job.class_name}): stage '{stage}' crashed: {e}")
                     job.status = "failed"
                     job.error = f"Worker crash during {stage}: {e}"
                     db2.commit()
+                    _mark_rule_failed(job, db2)
         except Exception as e:
             print(f"[SELF-LEARNING] Worker poll cycle error: {e}")
         finally:
@@ -595,6 +612,9 @@ def get_incidents(
                 if inc.screenshot_path:
                     filename = inc.screenshot_path.replace("incidents/", "")
                     d["screenshot_url"] = f"{PUBLIC_BASE_URL}/screenshots/{filename}"
+                if inc.clip_path:
+                    clip_filename = inc.clip_path.replace("incidents/", "")
+                    d["clip_url"] = f"{PUBLIC_BASE_URL}/screenshots/{clip_filename}"
                 result.append(d)
             return {"items": result, "total": total, "limit": limit, "offset": offset}
     except Exception:
@@ -608,6 +628,9 @@ def get_incidents(
         if "screenshot_path" in inc:
             filename = inc["screenshot_path"].replace("incidents/", "")
             inc["screenshot_url"] = f"{PUBLIC_BASE_URL}/screenshots/{filename}"
+        if inc.get("clip_path"):
+            clip_filename = inc["clip_path"].replace("incidents/", "")
+            inc["clip_url"] = f"{PUBLIC_BASE_URL}/screenshots/{clip_filename}"
     total = len(incidents)
     return {"items": incidents[offset:offset + limit], "total": total, "limit": limit, "offset": offset}
 
@@ -850,6 +873,7 @@ def get_training_job(
         "model_path": job.model_path,
         "error": job.error,
         "sample_images": sample_image_urls,
+        "vlm_check": job.vlm_check,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }
