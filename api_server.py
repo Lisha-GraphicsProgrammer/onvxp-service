@@ -238,6 +238,7 @@ def _self_learning_worker_loop():
     from db.models import TrainingJob
     from training_pipeline.data_acquisition import run_for_job as acquire_step
     from training_pipeline.dataset_prep import run_for_job as prep_step
+    from training_pipeline.validate_samples import run_for_job as validate_step
     from training_pipeline.train import run_for_job as train_step
     from training_pipeline.evaluate import run_for_job as eval_step
 
@@ -245,6 +246,7 @@ def _self_learning_worker_loop():
         "queued": acquire_step,
         "searching_data": acquire_step,
         "preparing_dataset": prep_step,
+        "validating_dataset": validate_step,
         "training": lambda jid, dbs, Model: train_step(jid, dbs, Model, epochs=10),
         "evaluating": eval_step,
     }
