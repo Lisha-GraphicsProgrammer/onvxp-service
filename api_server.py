@@ -125,6 +125,15 @@ class VideoStream:
             if self.cap:
                 self.cap.release()
             self.cap = cv2.VideoCapture(source)
+            # For a live network stream, OpenCV otherwise buffers several
+            # frames ahead internally — if our own read loop can't keep
+            # up frame-for-frame, that buffer fills, producing exactly
+            # the stutter-then-catch-up-jump pattern seen with the phone
+            # stream. Forcing buffer size to 1 makes every read() always
+            # return the newest frame instead of working through a
+            # backlog. Some backends silently ignore this property, in
+            # which case it's a harmless no-op, not a real risk.
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not self.cap.isOpened():
                 self.cap = None
                 self.running = False
@@ -1833,7 +1842,12 @@ def stop_pipeline(current_user: User = Depends(get_current_user)):
 
 
 def generate_frames(camera_id: int):
-    target_fps = 25
+    vs = video_streams.get(camera_id)
+    # A live network source (phone, RTSP camera) rarely sustains the same
+    # frame rate as a local video file — targeting a lower, genuinely
+    # achievable rate avoids constantly trying to "catch up," which is
+    # what produces a stutter-then-jump pattern rather than smooth motion.
+    target_fps = 15 if (vs and vs.is_live) else 25
     frame_interval = 1.0 / target_fps
     while True:
         start = time.time()
