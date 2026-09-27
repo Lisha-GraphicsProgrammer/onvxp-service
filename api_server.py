@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse, Response
@@ -47,6 +47,10 @@ app.add_middleware(
 
 os.makedirs("incidents", exist_ok=True)
 app.mount("/screenshots", StaticFiles(directory="incidents"), name="screenshots")
+
+UPLOADED_VIDEOS_DIR = Path("uploaded_videos")
+UPLOADED_VIDEOS_DIR.mkdir(exist_ok=True)
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
@@ -1891,7 +1895,7 @@ async def set_video_source(
     if raw_source == "" or raw_source is None:
         raise HTTPException(status_code=400, detail="source is required")
     source = _parse_source(raw_source)
-    if isinstance(source, str) and not source.startswith("rtsp://") and not Path(source).exists():
+    if isinstance(source, str) and not source.startswith("rtsp://") and not source.startswith("http://") and not source.startswith("https://") and not Path(source).exists():
         raise HTTPException(status_code=404, detail=f"File not found: {source}")
     with _video_streams_lock:
         vs = video_streams.get(camera_id) or VideoStream()
@@ -1921,7 +1925,14 @@ def _validate_source(source: str) -> str:
     source = (source or "").strip()
     if not source:
         raise HTTPException(status_code=400, detail="source is required")
-    if source.startswith("rtsp://"):
+    if source.startswith("rtsp://") or source.startswith("http://") or source.startswith("https://"):
+        # A network stream URL — actual reachability is tested downstream
+        # by cv2.VideoCapture when the stream is started, not here. This
+        # covers the HTTP/MJPEG and Phone camera types, both of which
+        # produce a plain http:// URL — without this check they'd fall
+        # through to the local-file check below and always be wrongly
+        # rejected as "File not found", since a URL is never a real path
+        # on this machine's disk.
         return source
     if source.isdigit():
         return source
@@ -1964,6 +1975,56 @@ def get_cameras(
     return result
 
 
+@app.post("/api/videos/upload")
+async def upload_video(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Actually receives and stores a video file uploaded from the browser,
+    returning the server-side path to use as a camera's "source". Without
+    this, a browser file-picker alone is misleading — _validate_source()
+    checks Path(source).exists() against THIS machine's disk, and a file
+    that only exists on the person's own computer would never satisfy
+    that check no matter how it was picked.
+    """
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can upload videos")
+
+    orig_name = file.filename or "upload"
+    ext = Path(orig_name).suffix.lower()
+    if ext not in ALLOWED_VIDEO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported video format '{ext}'. Allowed: {', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS))}",
+        )
+
+    # A browser-supplied filename is never trusted as a real path — this
+    # strips any directory components (so a crafted name like
+    # "../../something" can't write outside this upload folder) and
+    # prefixes a timestamp so two uploads sharing an original name never
+    # silently overwrite each other.
+    safe_stem = Path(orig_name).stem.replace("/", "_").replace("\\", "_")[:60]
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    safe_filename = f"{timestamp}_{safe_stem}{ext}"
+    dest_path = UPLOADED_VIDEOS_DIR / safe_filename
+
+    try:
+        with open(dest_path, "wb") as out_file:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                out_file.write(chunk)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded video: {e}")
+
+    # Returned as a plain relative path — this is exactly what
+    # _validate_source()/cv2.VideoCapture already expect as a camera's
+    # "source" value, the same as any other video file in this project.
+    return {"filename": str(dest_path), "size_bytes": dest_path.stat().st_size}
+
+
 @app.post("/api/cameras")
 def create_camera(
     body: CameraCreateRequest,
@@ -1993,12 +2054,24 @@ def create_camera(
     db.commit()
     db.refresh(cam)
 
-    return {
+    response = {
         "id": cam.id, "name": cam.name, "location": cam.location,
         "source": cam.source, "status": cam.status,
         "fps": cam.fps, "resolution": cam.resolution,
         "zone_id": cam.zone_id,
     }
+    if not vs:
+        # The camera is still saved (so the user doesn't lose their typed
+        # details and can just correct the IP/credentials and retry), but
+        # this tells the caller WHY it's offline instead of leaving it a
+        # silent, unexplained "offline" — a wrong password or unreachable
+        # IP should be obvious, not something to discover only once a rule
+        # later fails to detect anything on this camera.
+        response["connection_warning"] = (
+            "Camera was saved, but couldn't connect to the stream. "
+            "Check the IP address, port, and credentials, then try again."
+        )
+    return response
 
 
 @app.put("/api/cameras/{camera_id}")
@@ -2045,6 +2118,37 @@ def update_camera(
         "source": cam.source, "status": cam.status,
         "fps": cam.fps, "resolution": cam.resolution,
     }
+
+
+@app.delete("/api/cameras/{camera_id}")
+def delete_camera(
+    camera_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can delete cameras")
+    cam = db.query(CameraModel).filter(
+        CameraModel.id == camera_id,
+        CameraModel.site_id == current_user.site_id
+    ).first()
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    # Stop any running stream for this camera before removing its DB row —
+    # otherwise its background video-capture thread keeps running with
+    # nothing left in the database pointing back to it.
+    with _video_streams_lock:
+        vs = video_streams.pop(camera_id, None)
+    if vs:
+        try:
+            vs.stop()
+        except Exception as e:
+            print(f"[OMNIX] Error stopping stream for deleted camera {camera_id}: {e}")
+
+    db.delete(cam)
+    db.commit()
+    return {"status": "deleted", "id": camera_id}
 
 
 @app.get("/api/settings")
