@@ -103,10 +103,20 @@ def validate_dataset(dataset_dir: str, class_prompt: str, min_agreement: float =
 
 
 def run_for_job(job_id: int, db_session, TrainingJob):
-    """Runs the visual pre-flight check for a training job and updates its
-    DB row. Called right after dataset prep succeeds, before training ever
-    starts — this is the actual gate that stops a mismatched dataset from
-    burning a full training run before anyone notices."""
+    """
+    Runs the visual pre-flight check for a training job and updates its
+    DB row. Called right after dataset prep succeeds, before training
+    ever starts — this is the actual gate that stops a mismatched dataset
+    from burning a full training run before anyone notices.
+
+    On rejection, this no longer fails the job outright. data_acquisition.py
+    now stores every candidate the original search found, not just the one
+    that got downloaded — so a rejection here sends the job back to
+    acquisition to try the NEXT untried candidate from that same list,
+    rather than giving up after the very first, top-ranked pick turned out
+    to be a poor visual match. The job only genuinely fails once every
+    real candidate the search found has actually been tried and rejected.
+    """
     import os
     from datetime import datetime, timezone
 
@@ -133,6 +143,14 @@ def run_for_job(job_id: int, db_session, TrainingJob):
     result = validate_dataset(dataset_dir, class_prompt, anthropic_api_key=api_key)
 
     existing_info = dict(job.dataset_info or {})
+    validation_history = list(existing_info.get("validation_history", []))
+    validation_history.append({
+        "source": existing_info.get("source"),
+        "agreement_rate": result.get("agreement_rate"),
+        "passed": result["passed"],
+        "reason": result.get("reason"),
+    })
+    existing_info["validation_history"] = validation_history
     existing_info["validation_report"] = result
     job.dataset_info = existing_info
 
@@ -140,10 +158,40 @@ def run_for_job(job_id: int, db_session, TrainingJob):
         job.current_stage = "training"
         detail = f"{result['agreement_rate']:.0%} of {result['sample_size']} sampled images visually matched '{class_prompt}'"
         _push_stage("validating_dataset", "done", detail)
+        return
+
+    # Rejected — but is this genuinely the last real option, or are there
+    # other candidates the original search already found that haven't
+    # been tried yet? A candidate that got this far (downloaded, prepped)
+    # is also marked tried here, in case it wasn't already.
+    candidates = existing_info.get("candidates", [])
+    tried_keys = set(existing_info.get("tried_candidate_keys", []))
+    current_key = existing_info.get("candidate_key")
+    if current_key:
+        tried_keys.add(current_key)
+        existing_info["tried_candidate_keys"] = list(tried_keys)
+        job.dataset_info = existing_info
+
+    remaining = [c for c in candidates if f"{c.get('workspace')}/{c.get('project')}" not in tried_keys]
+
+    if remaining:
+        # A real, untried alternative exists from the original search —
+        # go try it instead of failing the whole job over one dataset
+        # among several genuine options.
+        job.current_stage = "searching_data"
+        detail = (
+            f"'{existing_info.get('source', 'this candidate')}' didn't visually match "
+            f"(only {result.get('agreement_rate', 0):.0%} agreement) — trying next "
+            f"candidate ({len(remaining)} of {len(candidates)} remaining)."
+        )
+        _push_stage("validating_dataset", "failed", detail)
     else:
         job.status = "failed"
-        job.error = f"Dataset didn't visually match requested class: {result['reason']}"
-        _push_stage("validating_dataset", "failed", result["reason"])
+        job.error = (
+            f"Tried {len(tried_keys)} candidate dataset(s) for '{class_prompt}', "
+            f"none visually matched well enough. Last: {result['reason']}"
+        )
+        _push_stage("validating_dataset", "failed", job.error)
         db_session.commit()
 
 
