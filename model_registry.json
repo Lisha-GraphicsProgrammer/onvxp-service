@@ -76,7 +76,18 @@
   "exposed_electrical_wire": {
     "type": "custom",
     "weights": "wire_lisha_best3.pt",
-    "confidence": 0.10,
-    "region": [450, 250, 720, 400]
+    "confidence": 0.1,
+    "region": [
+      450,
+      250,
+      720,
+      400
+    ]
+  },
+  "scaffolding": {
+    "type": "custom",
+    "weights": "C:\\dev\\onvxp-service\\runs\\self_learning\\scaffolding_model\\weights\\best.pt",
+    "confidence": 0.9198,
+    "conf_threshold": 0.5
   }
 }

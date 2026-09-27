@@ -922,7 +922,7 @@ def approve_training_job(
     activated_rule = None
     if job.rule_id:
         pending_rule = db.query(Rule).filter(Rule.id == job.rule_id).first()
-        if pending_rule and pending_rule.status == "pending_training":
+        if pending_rule and pending_rule.status in ("pending_training", "training_failed"):
             sibling_jobs = db.query(TrainingJob).filter(TrainingJob.rule_id == job.rule_id).all()
             if all(j.status == "approved" for j in sibling_jobs):
                 pending_rule.status = "active"
@@ -1720,11 +1720,20 @@ async def apply_rule(
                 jobs = db.query(TrainingJob).filter(
                     TrainingJob.site_id == current_user.site_id,
                     TrainingJob.class_name.in_(missing),
-                    TrainingJob.status.notin_(["failed", "cancelled"]),
-                ).all()
+                ).order_by(TrainingJob.id.desc()).all()
                 for job in jobs:
                     job.rule_id = rule.id
                 db.commit()
+                # A fast-failing job (e.g. "no dataset found", which fails
+                # in seconds) can already be terminal by the time this
+                # linking code runs — the background worker never revisits
+                # a job once it's failed/cancelled, so it will never get a
+                # chance to cascade onto THIS rule via the normal path.
+                # Do it here instead, immediately, so the rule doesn't sit
+                # stuck forever waiting on a job that's already dead.
+                if any(j.status == "failed" for j in jobs) and rule.status == "pending_training":
+                    rule.status = "training_failed"
+                    db.commit()
                 training_jobs = [
                     {"id": j.id, "class_name": j.class_name, "status": j.status, "reused": True}
                     for j in jobs

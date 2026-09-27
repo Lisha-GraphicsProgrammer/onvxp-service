@@ -40,7 +40,7 @@ def train_model(class_name: str, epochs: int = 6, imgsz: int = 416, resume_from:
                 model.add_callback("on_train_epoch_end", on_epoch_end)
             results = model.train(resume=True)
         else:
-            model = YOLO("yolo26n.pt") # smallest base model — fastest on CPU
+            model = YOLO("yolov8n.pt") # yolo26n.pt is incompatible with this environment's ultralytics version (SPPF signature mismatch, confirmed via live crash) — yolov8n.pt is proven working heres
             if on_epoch_end:
                 model.add_callback("on_train_epoch_end", on_epoch_end)
             results = model.train(

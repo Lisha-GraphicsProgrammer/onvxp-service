@@ -233,7 +233,7 @@ def prepare_dataset(class_name: str) -> dict:
             total_instances += result["label_instances"]
             total_discarded_other_class += result.get("discarded_other_class_instances", 0)
 
-    # ── Some Roboflow exports ship only a train split, no valid/test —
+        # ── Some Roboflow exports ship only a train split, no valid/test —
     # Ultralytics' training code requires data.yaml's val: path to actually
     # exist on disk, so carve off a small portion of train into a real
     # valid folder rather than failing at the training stage. ──
@@ -251,23 +251,49 @@ def prepare_dataset(class_name: str) -> dict:
             lbl_path = train_lbl_dir / (img_path.stem + ".txt")
             if lbl_path.exists():
                 shutil.move(str(lbl_path), str(valid_lbl_dir / lbl_path.name))
-        # re-check both splits now that files have actually moved — labels
-        # were already isolated/remapped above, this just re-counts after
-        # the move, it does not re-run the class filter a second time.
         report["splits"]["train"] = _check_split(dataset_dir / "train")
         report["splits"]["valid"] = _check_split(dataset_dir / "valid")
-        total_instances = (
-            report["splits"]["train"]["label_instances"]
-            + report["splits"]["valid"]["label_instances"]
-        )
-        total_corrupted = (
-            len(report["splits"]["train"]["corrupted_images"])
-            + len(report["splits"]["valid"]["corrupted_images"])
-        )
-        total_malformed = (
-            len(report["splits"]["train"]["malformed_labels"])
-            + len(report["splits"]["valid"]["malformed_labels"])
-        )
+
+    # ── Same problem, but for test: evaluate.py hardcodes split="test",
+    # so a dataset that ships train+valid but no test (common — many
+    # Roboflow uploaders never bother with a held-out test set) makes
+    # evaluation fail with a confusing Ultralytics data-loading error
+    # instead of a clear "no test split" message. Carve a small portion
+    # off valid (not train, which train already needs in full) into a
+    # real test folder, same technique as the valid-split fallback above. ──
+    if not report["splits"].get("test", {}).get("exists") and report["splits"].get("valid", {}).get("exists"):
+        valid_img_dir = dataset_dir / "valid" / "images"
+        valid_lbl_dir = dataset_dir / "valid" / "labels"
+        test_img_dir = dataset_dir / "test" / "images"
+        test_lbl_dir = dataset_dir / "test" / "labels"
+        all_valid_images = sorted(valid_img_dir.glob("*"))
+        test_split_count = max(1, len(all_valid_images) // 2)  # split valid ~50/50 with test
+        test_img_dir.mkdir(parents=True, exist_ok=True)
+        test_lbl_dir.mkdir(parents=True, exist_ok=True)
+        for img_path in all_valid_images[:test_split_count]:
+            shutil.move(str(img_path), str(test_img_dir / img_path.name))
+            lbl_path = valid_lbl_dir / (img_path.stem + ".txt")
+            if lbl_path.exists():
+                shutil.move(str(lbl_path), str(test_lbl_dir / lbl_path.name))
+        report["splits"]["valid"] = _check_split(dataset_dir / "valid")
+        report["splits"]["test"] = _check_split(dataset_dir / "test")
+
+    # ── Re-total everything once, after BOTH fallbacks above have had a
+    # chance to run and actually move files — doing this once here instead
+    # of duplicated inside each fallback block avoids double-counting or
+    # counting a split before its files have actually landed. ──
+    total_instances = sum(
+        report["splits"][s]["label_instances"]
+        for s in ("train", "valid", "test") if report["splits"].get(s, {}).get("exists")
+    )
+    total_corrupted = sum(
+        len(report["splits"][s]["corrupted_images"])
+        for s in ("train", "valid", "test") if report["splits"].get(s, {}).get("exists")
+    )
+    total_malformed = sum(
+        len(report["splits"][s]["malformed_labels"])
+        for s in ("train", "valid", "test") if report["splits"].get(s, {}).get("exists")
+    )
 
     report["total_label_instances"] = total_instances
     report["total_corrupted_images"] = total_corrupted
