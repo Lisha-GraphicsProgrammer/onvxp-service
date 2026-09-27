@@ -355,9 +355,37 @@ def run_for_job(job_id: int, db_session, TrainingJob):
                   f"{result['total_malformed_labels']} malformed labels skipped")
         _push_stage("preparing_dataset", "done", detail)
     else:
-        job.status = "failed"
-        job.error = result.get("error", "Dataset preparation failed")
-        _push_stage("preparing_dataset", "failed", result.get("error"))
+        # ── This candidate's downloaded data turned out unusable (class
+        # not actually present despite matching the search, corrupted
+        # images, zero labeled instances after isolation) — same fallback
+        # philosophy as validate_samples.py's own visual-mismatch
+        # rejection: don't fail the whole job over ONE bad candidate if
+        # the original search already found real, untried alternatives. ──
+        existing_info = dict(job.dataset_info or {})
+        candidates = existing_info.get("candidates", [])
+        tried_keys = set(existing_info.get("tried_candidate_keys", []))
+        current_key = existing_info.get("candidate_key")
+        if current_key:
+            tried_keys.add(current_key)
+        existing_info["tried_candidate_keys"] = list(tried_keys)
+        job.dataset_info = existing_info
+
+        remaining = [c for c in candidates if f"{c.get('workspace')}/{c.get('project')}" not in tried_keys]
+        if remaining:
+            job.current_stage = "searching_data"
+            detail = (
+                f"'{existing_info.get('source', 'this candidate')}' couldn't be prepared "
+                f"({result.get('error', 'unknown error')}) — trying next candidate "
+                f"({len(remaining)} of {len(candidates)} remaining)."
+            )
+            _push_stage("preparing_dataset", "failed", detail)
+        else:
+            job.status = "failed"
+            job.error = (
+                f"Tried {len(tried_keys)} candidate dataset(s) for '{job.class_name}', "
+                f"none could be prepared. Last: {result.get('error', 'unknown error')}"
+            )
+            _push_stage("preparing_dataset", "failed", job.error)
 
 
 if __name__ == "__main__":

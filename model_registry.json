@@ -89,5 +89,17 @@
     "weights": "C:\\dev\\onvxp-service\\runs\\self_learning\\scaffolding_model\\weights\\best.pt",
     "confidence": 0.9198,
     "conf_threshold": 0.5
+  },
+  "welding mask": {
+    "type": "custom",
+    "weights": "C:\\dev\\onvxp-service\\runs\\self_learning\\welding mask_model\\weights\\best.pt",
+    "confidence": 0.5486,
+    "conf_threshold": 0.5
+  },
+  "fire_extinguisher": {
+    "type": "custom",
+    "weights": "C:\\dev\\onvxp-service\\runs\\self_learning\\fire_extinguisher_model\\weights\\best.pt",
+    "confidence": 0.7379,
+    "conf_threshold": 0.5
   }
 }

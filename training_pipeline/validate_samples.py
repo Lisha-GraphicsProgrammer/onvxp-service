@@ -5,16 +5,48 @@ from the isolated class and asks a vision model directly: does this image
 actually show the target class? Rejects the whole candidate dataset if
 agreement is too low — BEFORE training ever starts, not after.
 """
-import glob
 import random
 import base64
 from pathlib import Path
 
 
 def sample_images(dataset_dir: str, n: int = 12) -> list[str]:
-    imgs = glob.glob(str(Path(dataset_dir) / "train" / "images" / "*"))
-    random.shuffle(imgs)
-    return imgs[:n]
+    """
+    Samples images to show the VLM for a visual sanity check. Only from
+    images that actually HAVE a labeled instance of the isolated target
+    class — not the whole training pool.
+
+    dataset_prep.py deliberately keeps negative examples (images where
+    the isolated class has zero instances after filtering out every other
+    class) as legitimate training data — that's correct for training
+    itself. But sampling from that FULL pool here means a large share of
+    any random sample can be genuine negatives the annotator never
+    claimed showed the target class at all. Asking the VLM "does this
+    show X" on those negatives, and it correctly says no — dragging the
+    agreement rate down for reasons that have nothing to do with whether
+    the actual positive-labeled examples are good.
+
+    Confirmed via direct evidence during live testing: a randomly sampled
+    image clearly showing a person wearing eyewear had zero drawn label
+    box for the isolated "glasses" class — it was a genuine negative
+    example (the annotator's attention was on other PPE items in that
+    photo), not a bad or mislabeled positive one. Falls back to the full
+    pool only if a dataset genuinely has no positive-labeled images at
+    all, so this never returns an empty sample outright.
+    """
+    img_dir = Path(dataset_dir) / "train" / "images"
+    lbl_dir = Path(dataset_dir) / "train" / "labels"
+    all_imgs = list(img_dir.glob("*"))
+
+    positive_imgs = []
+    for img_path in all_imgs:
+        lbl_path = lbl_dir / (img_path.stem + ".txt")
+        if lbl_path.exists() and lbl_path.read_text().strip():
+            positive_imgs.append(str(img_path))
+
+    pool = positive_imgs if positive_imgs else [str(p) for p in all_imgs]
+    random.shuffle(pool)
+    return pool[:n]
 
 
 def verify_with_dino(image_paths, class_prompt, confidence=0.3):

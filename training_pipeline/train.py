@@ -126,9 +126,35 @@ def run_for_job(job_id: int, db_session, TrainingJob, epochs: int = 10):
         job.current_stage = "evaluating"
         _push_stage("training", "done", f"Trained {result['epochs_run']} epochs — weights saved")
     else:
-        job.status = "failed"
-        job.error = result["error"]
-        _push_stage("training", "failed", result["error"])
+        # ── Training crashed on this specific candidate's data — same
+        # fallback as every earlier stage: try the next real candidate
+        # from the original search before failing the whole job. ──
+        existing_info = dict(job.dataset_info or {})
+        candidates = existing_info.get("candidates", [])
+        tried_keys = set(existing_info.get("tried_candidate_keys", []))
+        current_key = existing_info.get("candidate_key")
+        if current_key:
+            tried_keys.add(current_key)
+        existing_info["tried_candidate_keys"] = list(tried_keys)
+        job.dataset_info = existing_info
+
+        remaining = [c for c in candidates if f"{c.get('workspace')}/{c.get('project')}" not in tried_keys]
+        if remaining:
+            job.current_stage = "searching_data"
+            job.checkpoint_path = None  # don't carry a stale checkpoint into a different dataset
+            detail = (
+                f"Training failed on '{existing_info.get('source', 'this candidate')}' "
+                f"({result['error']}) — trying next candidate "
+                f"({len(remaining)} of {len(candidates)} remaining)."
+            )
+            _push_stage("training", "failed", detail)
+        else:
+            job.status = "failed"
+            job.error = (
+                f"Tried {len(tried_keys)} candidate dataset(s) for '{job.class_name}', "
+                f"training failed on all of them. Last: {result['error']}"
+            )
+            _push_stage("training", "failed", job.error)
 
 
 if __name__ == "__main__":
