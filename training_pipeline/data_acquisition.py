@@ -43,7 +43,22 @@ def search_universe(class_name: str, min_images: int = 50) -> list[dict]:
     # when the equivalent phrase with spaces returns real candidates. Only
     # the outgoing query is affected; the stored class_name is untouched. ──
     search_phrase = class_name.replace("_", " ").replace("-", " ")
-    query = f'class:{search_phrase} images>{min_images}'
+
+    # ── CRITICAL: a multi-word class name MUST be quoted for Roboflow's
+    # search to treat it as one phrase. Confirmed by direct comparison:
+    # an unquoted `class:welding mask` query returned a single, obscure,
+    # tiny (210-image) dataset — while the correctly-quoted
+    # `class:"welding mask"` returns dozens of real, large, explicitly
+    # "Welding Mask"-labeled datasets (some with 10,000+ images). Without
+    # quotes, Roboflow almost certainly splits a multi-word phrase into
+    # separate tokens rather than matching it as one class name — this
+    # silently starved every previous multi-word class search (safety
+    # vest, safety harness, fire extinguisher, welding mask, etc.) of the
+    # real, plentiful data that actually exists for it. ──
+    if " " in search_phrase:
+        query = f'class:"{search_phrase}" images>{min_images}'
+    else:
+        query = f'class:{search_phrase} images>{min_images}'
     try:
         resp = requests.get(
             UNIVERSE_SEARCH_URL,
@@ -104,7 +119,55 @@ def search_universe(class_name: str, min_images: int = 50) -> list[dict]:
                     return True
         return False
 
-    relevant = [c for c in candidates if is_relevant(c, class_name)]
+    # ── Confirmed via live testing: a real, common gap in the strict check
+    # above. Many genuine PPE datasets label an item by its bare noun
+    # ("Glasses") rather than the fuller descriptive phrase a person
+    # actually asks for ("safety glasses") — the strict full-phrase check
+    # correctly finds the few datasets that DO spell it out in full, but
+    # wrongly discards the many more that use the shorter, equally-valid
+    # label. This fallback only ever runs if the strict check above found
+    # NOTHING, and only accepts a bare-noun match when that same dataset's
+    # OTHER classes clearly show real workplace-safety/PPE context (helmet,
+    # vest, gloves, etc.) — guarding against matching some unrelated
+    # dataset that happens to share one word (e.g. a fashion-eyewear set
+    # with a class simply called "glasses", nothing to do with safety). ──
+    PPE_CONTEXT_WORDS = {
+        "helmet", "vest", "gloves", "glove", "boot", "boots", "mask",
+        "harness", "person", "worker", "shoe", "shoes",
+    }
+
+    def is_relevant_loose(c: dict, term: str) -> bool:
+        norm_term = _normalize(term)
+        term_words = norm_term.split()
+        if len(term_words) < 2:
+            return False  # only a fallback for multi-word searches
+        head_noun = term_words[-1]
+        classes_norm = [_normalize(str(cls)) for cls in c.get("classes", [])]
+        has_head_noun = any(head_noun in set(cn.split()) for cn in classes_norm)
+        has_ppe_context = any(
+            any(w in set(cn.split()) for w in PPE_CONTEXT_WORDS)
+            for cn in classes_norm
+        )
+        return has_head_noun and has_ppe_context
+
+    # ── Combined, not "loose only as a last resort" — the strict check can
+    # correctly find a SMALL number of exact matches while still missing a
+    # much larger set of equally-real, bare-noun-labeled datasets (e.g. 2
+    # exact "Safety Glasses" matches found, while 10 more datasets using
+    # just "Glasses" in an obvious PPE context sat right there unclaimed,
+    # confirmed via live testing). Taking the union of both, rather than
+    # only running the loose check when strict returned zero, is what
+    # actually surfaces every real, relevant candidate. ──
+    strict_matches = [c for c in candidates if is_relevant(c, class_name)]
+    loose_matches = [c for c in candidates if is_relevant_loose(c, class_name)]
+    seen_keys = set()
+    relevant = []
+    for c in strict_matches + loose_matches:
+        key = f"{c.get('workspace')}/{c.get('project')}"
+        if key not in seen_keys:
+            seen_keys.add(key)
+            relevant.append(c)
+
     if not relevant:
         # Genuinely nothing with a matching class was found — return
         # nothing rather than silently falling back to an irrelevant

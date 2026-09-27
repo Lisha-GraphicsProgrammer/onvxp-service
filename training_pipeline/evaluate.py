@@ -223,10 +223,40 @@ def run_for_job(job_id: int, db_session, TrainingJob):
     _push_stage("evaluating", "running", "Testing candidate model against held-out test set...")
     result = evaluate_model(job.class_name, job.model_path, job_id=job.id)
 
+    def _try_next_or_fail(failure_reason: str):
+        """Shared by both failure paths below — same fallback philosophy
+        as every earlier stage: try the next real candidate from the
+        original search before failing the whole job over one bad
+        candidate's model."""
+        existing_info = dict(job.dataset_info or {})
+        candidates = existing_info.get("candidates", [])
+        tried_keys = set(existing_info.get("tried_candidate_keys", []))
+        current_key = existing_info.get("candidate_key")
+        if current_key:
+            tried_keys.add(current_key)
+        existing_info["tried_candidate_keys"] = list(tried_keys)
+        job.dataset_info = existing_info
+
+        remaining = [c for c in candidates if f"{c.get('workspace')}/{c.get('project')}" not in tried_keys]
+        if remaining:
+            job.current_stage = "searching_data"
+            job.checkpoint_path = None
+            detail = (
+                f"'{existing_info.get('source', 'this candidate')}' didn't pass evaluation "
+                f"({failure_reason}) — trying next candidate "
+                f"({len(remaining)} of {len(candidates)} remaining)."
+            )
+            _push_stage("evaluating", "failed", detail)
+        else:
+            job.status = "failed"
+            job.error = (
+                f"Tried {len(tried_keys)} candidate dataset(s) for '{job.class_name}', "
+                f"none produced a model that passed evaluation. Last: {failure_reason}"
+            )
+            _push_stage("evaluating", "failed", job.error)
+
     if not result["success"]:
-        job.status = "failed"
-        job.error = result["error"]
-        _push_stage("evaluating", "failed", result["error"])
+        _try_next_or_fail(result["error"])
         return
 
     job.metrics = result["metrics"]
@@ -243,9 +273,7 @@ def run_for_job(job_id: int, db_session, TrainingJob):
         job.current_stage = "awaiting_approval"
         _push_stage("evaluating", "done", detail + " — passed acceptance gates")
     else:
-        job.status = "failed"
-        job.error = "Failed acceptance gates: " + "; ".join(result["gate_failures"])
-        _push_stage("evaluating", "failed", detail + " — " + "; ".join(result["gate_failures"]))
+        _try_next_or_fail("; ".join(result["gate_failures"]))
 
 
 if __name__ == "__main__":
