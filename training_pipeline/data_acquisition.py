@@ -5,9 +5,18 @@ Given a class name (e.g. "trousers"), performs a REAL live search against
 Roboflow's Universe Search API (GET /universe/search) to find candidate
 public datasets, ranks them, and downloads the best match. No hardcoded
 class list — any class name the user asks for gets searched for real.
+
+Every candidate the search finds is stored on the job (not just the
+winner), and if a later stage (validate_samples.py) rejects the current
+candidate as a visual mismatch, run_for_job resumes here and tries the
+next real candidate from that same original search — rather than the
+job failing outright the moment the very first, top-ranked pick turns
+out to be a poor match. Genuine failure only happens once every
+candidate the search actually found has been tried and rejected.
 """
 import os
 import json
+import shutil
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
@@ -118,10 +127,62 @@ def search_universe(class_name: str, min_images: int = 50) -> list[dict]:
     return relevant
 
 
+def _candidate_key(candidate: dict) -> str:
+    """A stable identifier for one candidate, used to track which ones a
+    job has already tried — workspace/project, not including version,
+    since retrying the exact same dataset at a different version isn't a
+    genuinely different candidate for our purposes."""
+    return f"{candidate.get('workspace')}/{candidate.get('project')}"
+
+
+def _download_candidate(candidate: dict, class_name: str) -> dict:
+    """
+    Downloads exactly ONE specific candidate (not a top-3 sweep — that
+    happens one call at a time now, driven by run_for_job, so a caller can
+    decide what to do between attempts: re-validate, try the next one,
+    or stop). Clears the destination folder first, so a previous
+    candidate's leftover files can never mix with this one's — without
+    this, a rejected candidate's images could silently remain and get
+    counted alongside the next candidate's during prep/validation.
+    """
+    ws, proj, ver = candidate.get("workspace"), candidate.get("project"), candidate.get("version")
+    if not ws or not proj:
+        return {"success": False, "error": "candidate is missing workspace/project"}
+
+    api_key = os.getenv("ROBOFLOW_API_KEY")
+    if not api_key:
+        return {"success": False, "error": "ROBOFLOW_API_KEY not set in .env"}
+
+    dest = DATASETS_DIR / class_name
+    shutil.rmtree(dest, ignore_errors=True)
+
+    try:
+        rf = Roboflow(api_key=api_key)
+        project = rf.workspace(ws).project(proj)
+        project.version(ver).download("yolov8", location=str(dest))
+        img_dir = dest / "train" / "images"
+        image_count = sum(1 for _ in img_dir.glob("*")) if img_dir.exists() else 0
+        if image_count == 0:
+            return {"success": False, "error": f"{ws}/{proj} downloaded but produced 0 images (likely a partial/failed download)"}
+        return {
+            "success": True,
+            "path": str(dest),
+            "source": f"{ws}/{proj} v{ver}",
+            "candidate_key": _candidate_key(candidate),
+            "image_count": image_count,
+            "license": candidate.get("license"),
+        }
+    except Exception as e:
+        return {"success": False, "error": f"{ws}/{proj}: {e}"}
+
+
 def acquire_dataset(class_name: str) -> dict:
     """
     Searches Universe live for class_name, downloads the top-ranked candidate.
     Returns a dict describing the outcome — always, even on failure.
+    Kept simple (tries top 3 for download failures only) for direct CLI/
+    testing use; run_for_job below does the fuller, resumable version that
+    also retries across VISUAL mismatches, not just download failures.
     """
     api_key = os.getenv("ROBOFLOW_API_KEY")
     if not api_key:
@@ -137,29 +198,11 @@ def acquire_dataset(class_name: str) -> dict:
 
     last_error = None
     for candidate in candidates[:3]:  # try top 3 in case one fails to download
-        ws, proj, ver = candidate["workspace"], candidate["project"], candidate["version"]
-        if not ws or not proj:
-            continue
-        try:
-            rf = Roboflow(api_key=api_key)
-            project = rf.workspace(ws).project(proj)
-            project.version(ver).download("yolov8", location=str(DATASETS_DIR / class_name))
-            img_dir = DATASETS_DIR / class_name / "train" / "images"
-            image_count = sum(1 for _ in img_dir.glob("*")) if img_dir.exists() else 0
-            if image_count == 0:
-                last_error = f"{ws}/{proj} downloaded but produced 0 images (likely a partial/failed download)"
-                continue
-            return {
-                "success": True,
-                "path": str(DATASETS_DIR / class_name),
-                "source": f"{ws}/{proj} v{ver}",
-                "image_count": image_count,
-                "license": candidate.get("license"),
-                "candidates_considered": len(candidates),
-            }
-        except Exception as e:
-            last_error = str(e)
-            continue
+        result = _download_candidate(candidate, class_name)
+        if result["success"]:
+            result["candidates_considered"] = len(candidates)
+            return result
+        last_error = result["error"]
 
     return {
         "success": False,
@@ -168,10 +211,18 @@ def acquire_dataset(class_name: str) -> dict:
 
 
 def run_for_job(job_id: int, db_session, TrainingJob):
-    """Runs acquisition for a training job and updates its DB row with progress."""
+    """
+    Runs acquisition for a training job and updates its DB row with
+    progress. Resumable: if this job already has a stored candidate list
+    (because validate_samples.py sent it back here after rejecting a
+    previous candidate as a visual mismatch), reuses that same original
+    search's ranked list and works through the next untried candidate(s),
+    rather than re-querying Universe or giving up after a single attempt.
+    Genuine failure only happens once every real candidate the original
+    search found has actually been tried.
+    """
     from datetime import datetime, timezone
     import threading
-    import time
 
     job = db_session.query(TrainingJob).filter(TrainingJob.id == job_id).first()
     if not job:
@@ -192,78 +243,121 @@ def run_for_job(job_id: int, db_session, TrainingJob):
         job.current_stage = name if status == "running" else job.current_stage
         db_session.commit()
 
-    _push_stage("searching_data", "running", f"Searching Roboflow Universe for '{job.class_name}'...")
+    existing_info = dict(job.dataset_info or {})
+    candidates = existing_info.get("candidates")
+    tried_keys = set(existing_info.get("tried_candidate_keys", []))
 
-    candidates = search_universe(job.class_name)
-    if not candidates:
+    if candidates:
+        _push_stage(
+            "searching_data", "running",
+            f"Trying next candidate for '{job.class_name}' ({len(tried_keys)} already tried)...",
+        )
+    else:
+        _push_stage("searching_data", "running", f"Searching Roboflow Universe for '{job.class_name}'...")
+        candidates = search_universe(job.class_name)
+        if not candidates:
+            job.status = "failed"
+            job.error = (
+                f"No public Roboflow dataset found for class '{job.class_name}' "
+                f"(searched live via Universe Search API, 0 results with images>50)."
+            )
+            _push_stage("searching_data", "failed", job.error)
+            return
+        existing_info["candidates"] = candidates
+        job.dataset_info = existing_info
+        db_session.commit()
+
+    remaining = [c for c in candidates if _candidate_key(c) not in tried_keys]
+    if not remaining:
         job.status = "failed"
         job.error = (
-            f"No public Roboflow dataset found for class '{job.class_name}' "
-            f"(searched live via Universe Search API, 0 results with images>50)."
+            f"Tried all {len(candidates)} candidate dataset(s) found for "
+            f"'{job.class_name}' — none produced a usable download. See "
+            f"dataset_info for details on each attempt."
         )
         _push_stage("searching_data", "failed", job.error)
         return
 
-    top = candidates[0]
-    target_total = top.get("images", 0) or None
-    img_dir = DATASETS_DIR / job.class_name / "train" / "images"
-    source_label = f"{top['workspace']}/{top['project']}"
+    result = None
+    last_download_error = None
+    for candidate in remaining:
+        target_total = candidate.get("images", 0) or None
+        img_dir = DATASETS_DIR / job.class_name / "train" / "images"
+        source_label = _candidate_key(candidate)
 
-    # ── the actual download call below blocks for its full duration with no
-    # progress hook exposed by the Roboflow SDK, so a separate thread polls
-    # the destination folder's growing file count instead. It uses its own
-    # DB session (not job's/db_session, which belongs to the main thread) so
-    # the two never touch the same SQLAlchemy Session concurrently. ──
-    stop_flag = threading.Event()
+        # ── the actual download call below blocks for its full duration
+        # with no progress hook exposed by the Roboflow SDK, so a separate
+        # thread polls the destination folder's growing file count
+        # instead. It uses its own DB session (not job's/db_session, which
+        # belongs to the main thread) so the two never touch the same
+        # SQLAlchemy Session concurrently. ──
+        stop_flag = threading.Event()
 
-    def _poll_download_progress():
-        from db.session import SessionLocal
-        poll_db = SessionLocal()
+        def _poll_download_progress():
+            from db.session import SessionLocal
+            poll_db = SessionLocal()
+            try:
+                while not stop_flag.wait(1.5):
+                    try:
+                        count = sum(1 for _ in img_dir.glob("*")) if img_dir.exists() else 0
+                        if count > 0:
+                            j = poll_db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+                            if not j:
+                                continue
+                            total_label = f" of {target_total}" if target_total else ""
+                            stages = list(j.stages or [])
+                            stages.append({
+                                "name": "searching_data", "status": "running",
+                                "detail": f"Downloading {count}{total_label} images from {source_label}...",
+                                "progress_current": count,
+                                "progress_total": target_total,
+                                "finished_at": datetime.now(timezone.utc).isoformat(),
+                            })
+                            j.stages = stages
+                            poll_db.commit()
+                    except Exception:
+                        poll_db.rollback()
+            finally:
+                poll_db.close()
+
+        poller = threading.Thread(target=_poll_download_progress, daemon=True)
+        poller.start()
         try:
-            while not stop_flag.wait(1.5):
-                try:
-                    count = sum(1 for _ in img_dir.glob("*")) if img_dir.exists() else 0
-                    if count > 0:
-                        j = poll_db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
-                        if not j:
-                            continue
-                        total_label = f" of {target_total}" if target_total else ""
-                        stages = list(j.stages or [])
-                        stages.append({
-                            "name": "searching_data", "status": "running",
-                            "detail": f"Downloading {count}{total_label} images from {source_label}...",
-                            "progress_current": count,
-                            "progress_total": target_total,
-                            "finished_at": datetime.now(timezone.utc).isoformat(),
-                        })
-                        j.stages = stages
-                        poll_db.commit()
-                except Exception:
-                    poll_db.rollback()
+            attempt = _download_candidate(candidate, job.class_name)
         finally:
-            poll_db.close()
+            stop_flag.set()
+            poller.join(timeout=3)
 
-    poller = threading.Thread(target=_poll_download_progress, daemon=True)
-    poller.start()
-    try:
-        result = acquire_dataset(job.class_name)
-    finally:
-        stop_flag.set()
-        poller.join(timeout=3)
+        # ── the poller may have committed its own last snapshot of
+        # `job.stages`/`job.dataset_info` from its separate session —
+        # refresh so this thread's next commit doesn't silently overwrite
+        # that history with a stale in-memory copy ──
+        db_session.refresh(job)
+        existing_info = dict(job.dataset_info or {})
+        tried_keys.add(source_label)
+        existing_info["tried_candidate_keys"] = list(tried_keys)
 
-    # ── the poller may have committed its own last snapshot of `job.stages`
-    # from its separate session — refresh so this thread's next commit
-    # doesn't silently overwrite that history with a stale in-memory copy ──
-    db_session.refresh(job)
+        if attempt["success"]:
+            existing_info.update(attempt)
+            job.dataset_info = existing_info
+            result = attempt
+            break
+        last_download_error = attempt["error"]
+        existing_info["last_download_error"] = last_download_error
+        job.dataset_info = existing_info
+        db_session.commit()
 
-    if result["success"]:
-        job.dataset_info = result
+    if result:
         job.current_stage = "preparing_dataset"
         _push_stage("searching_data", "done", f"Found {result['image_count']} images from {result['source']}")
     else:
         job.status = "failed"
-        job.error = result["error"]
-        _push_stage("searching_data", "failed", result["error"])
+        job.error = (
+            f"Tried all {len(candidates)} candidate dataset(s) found for "
+            f"'{job.class_name}' — none could be downloaded successfully. "
+            f"Last error: {last_download_error}"
+        )
+        _push_stage("searching_data", "failed", job.error)
 
 
 if __name__ == "__main__":
